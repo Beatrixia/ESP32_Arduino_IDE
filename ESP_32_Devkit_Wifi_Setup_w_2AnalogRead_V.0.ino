@@ -25,7 +25,7 @@
 static const int      Baud = 115200;            // Baud-rate for uart communicate
 static const char*    AP_SSID = "ESP32-Setup";
 static const char*    AP_PASS = "setup1234";    // min 8 chars, change if you like
-static const int      SETUP_PIN = 13;          // jumper this pin to GND at boot to force setup
+static const int      SETUP_PIN = 13;           // jumper this pin to GND at boot to force setup
 static const uint32_t CONNECT_TIMEOUT_MS = 20000;
 
 enum NetMode { MODE_OPEN = 0, MODE_PSK = 1, MODE_ENTERPRISE = 2 };
@@ -42,6 +42,59 @@ Preferences prefs;
 WebServer   server(80);
 Config      cfg;
 bool        setupMode = false;
+
+// ---------- Analog Setup ----------
+
+// Analog Set-up Wifi already use ADC2
+// Can only use ADC1 GPIO32,33,34,35,36,39
+static const int ANALOG_PIN_1 = 34;             // Analog Read Pin (ADC1_CH6)
+static const int ANALOG_PIN_2 = 35;             // Analog Read Pin (ADC1_CH7)
+
+int rawAnalog1 = 0;
+int rawAnalog2 = 0;
+
+unsigned long lastAnalogCheck = 0;
+const unsigned long ANALOG_INTERVAL = 1000;     // Make Analog read every 1000ms
+
+void handleAnalogTasks() {
+  if (millis() - lastAnalogCheck >= ANALOG_INTERVAL) {
+    lastAnalogCheck = millis();
+
+    // Read Analog 12-bit (0 - 4095)
+    rawAnalog1 = analogRead(ANALOG_PIN_1);
+    rawAnalog2 = analogRead(ANALOG_PIN_2);
+
+    Serial.printf("[Analog Raw] Pin %d: %d | Pin %d: %d\n", 
+                  ANALOG_PIN_1, rawAnalog1,
+                  ANALOG_PIN_2, rawAnalog2);
+  }
+}
+
+// ---------- Ref Values (NVS Storage) ----------
+struct RefConfig {
+  int ref1 = 0;
+  int ref2 = 0;
+};
+
+RefConfig refCfg;
+
+void loadRefConfig() {
+  prefs.begin("analog_ref", true); // อ่านค่าอย่างเดียว (Read-only)
+  refCfg.ref1 = prefs.getInt("ref1", 0);
+  refCfg.ref2 = prefs.getInt("ref2", 0);
+  prefs.end();
+  Serial.printf("[NVS] Loaded Ref: Ref1 = %d, Ref2 = %d\n", refCfg.ref1, refCfg.ref2);
+}
+
+void saveRefConfig(int newRef1, int newRef2) {
+  prefs.begin("analog_ref", false); // เปิดโหมดเขียน
+  prefs.putInt("ref1", newRef1);
+  prefs.putInt("ref2", newRef2);
+  prefs.end();
+  refCfg.ref1 = newRef1;
+  refCfg.ref2 = newRef2;
+  Serial.printf("[NVS] Saved New Ref: Ref1 = %d, Ref2 = %d\n", refCfg.ref1, refCfg.ref2);
+}
 
 // ---------- storage ----------
 
@@ -115,9 +168,24 @@ const char PAGE[] PROGMEM = R"rawliteral(
 <h2>ESP32 Wi-Fi Setup</h2>
 
 <div class="mac-box">
-  <label style="margin-top:0;">Device MAC Address (STA):</label>
-  <input type="text" value="%MAC%" readonly onclick="this.select();">
-  <small style="display:block; margin-top:4px;">(ใช้สำหรับลงทะเบียน Wi-Fi มหาวิทยาลัย / องค์กร)</small>
+  <label style="margin-top:0;">Analog Calibration (Ref Value):</label>
+  
+  <div style="display:flex; gap:10px; margin-top:6px;">
+    <div style="flex:1; text-align:center;">
+      <small>GPIO34 (Live / Ref)</small>
+      <input type="text" id="a1_val" value="%A1% / %REF1%" readonly style="font-size:16px; text-align:center;">
+    </div>
+    <div style="flex:1; text-align:center;">
+      <small>GPIO35 (Live / Ref)</small>
+      <input type="text" id="a2_val" value="%A2% / %REF2%" readonly style="font-size:16px; text-align:center;">
+    </div>
+  </div>
+
+  <form method="POST" action="/save_ref" style="margin-top:10px;">
+    <button type="submit" style="background:#28a745; color:white; border:none; border-radius:4px; padding:8px; margin-top:5px; cursor:pointer;">
+      📌 Set Current Analog as Ref (Save to Flash)
+    </button>
+  </form>
 </div>
 
 <form method="POST" action="/save">
@@ -180,6 +248,16 @@ function updHiddenSsid() {
   document.getElementById('ssid_hidden').value = document.getElementById('custom_ssid').value;
 }
 
+setInterval(function() {
+  fetch('/api/analog')
+    .then(res => res.json())
+    .then(data => {
+      document.getElementById('a1_val').value = data.a1;
+      document.getElementById('a2_val').value = data.a2;
+    })
+    .catch(err => console.log(err));
+}, 1000);
+
 upd();
 onSsidSelectChange();
 </script>
@@ -217,7 +295,20 @@ void handleRoot() {
   html.reserve(sizeof(PAGE) + 1500);
   html = FPSTR(PAGE);
 
+  // 1. อ่านค่า Analog สด ณ วินาทีที่ผู้ใช้เปิด/รีเฟรชหน้าเว็บ
+  int a1 = analogRead(ANALOG_PIN_1);
+  int a2 = analogRead(ANALOG_PIN_2);
+
+  // 2. แทนที่ค่า MAC Address
   html.replace("%MAC%", WiFi.macAddress());
+
+  // 3. แทนที่ค่า Live Analog และค่า Ref ที่โหลดมาจาก NVS
+  html.replace("%A1%", String(a1));
+  html.replace("%A2%", String(a2));
+  html.replace("%REF1%", String(refCfg.ref1));
+  html.replace("%REF2%", String(refCfg.ref2));
+
+  // 4. แทนที่การตั้งค่า Wi-Fi เดิม
   html.replace("%WIFI_OPTIONS%", getScanResultsHTML());
   html.replace("%SSID%", htmlEscape(cfg.ssid));
   html.replace("%USER%", htmlEscape(cfg.username));
@@ -225,7 +316,8 @@ void handleRoot() {
   html.replace("%SEL0%", cfg.mode == MODE_OPEN ? "selected" : "");
   html.replace("%SEL1%", cfg.mode == MODE_PSK ? "selected" : "");
   html.replace("%SEL2%", cfg.mode == MODE_ENTERPRISE ? "selected" : "");
-  
+
+  // 5. ส่งหน้าเว็บกลับไปแสดงผล
   server.send(200, "text/html", html);
 }
 
@@ -256,6 +348,23 @@ void handleSave() {
   ESP.restart();
 }
 
+void handleSaveRef() {
+  // อ่านค่า Analog ณ วินาทีที่กดปุ่ม
+  int currentA1 = analogRead(ANALOG_PIN_1);
+  int currentA2 = analogRead(ANALOG_PIN_2);
+
+  // บันทึกลง NVS
+  saveRefConfig(currentA1, currentA2);
+
+  // ตอบกลับผู้ใช้และให้เด้งกลับหน้าเดิม
+  server.send(200, "text/html",
+              "<html><body style='font-family:sans-serif; text-align:center; padding-top:50px;'>"
+              "<h3>✅ Reference Values Saved!</h3>"
+              "<p>Ref 1: " + String(currentA1) + " | Ref 2: " + String(currentA2) + "</p>"
+              "<script>setTimeout(function(){ window.location.href='/'; }, 2000);</script>"
+              "</body></html>");
+}
+
 void startSetupMode() {
   setupMode = true;
   WiFi.disconnect(true);
@@ -263,11 +372,16 @@ void startSetupMode() {
   WiFi.softAP(AP_SSID, AP_PASS);
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/save_ref", HTTP_POST, handleSaveRef);
   server.onNotFound(handleRoot);
   server.begin();
   Serial.println("Setup mode started");
   Serial.printf("Join Wi-Fi '%s' (password '%s'), then open http://%s\n",
                 AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
+  server.on("/api/analog", HTTP_GET, []() {
+  String json = "{\"a1\":" + String(rawAnalog1) + ",\"a2\":" + String(rawAnalog2) + "}";
+  server.send(200, "application/json", json);
+  });
 }
 
 // ---------- API Services ----------
@@ -401,6 +515,11 @@ void setup() {
   delay(500);
   pinMode(SETUP_PIN, INPUT_PULLUP);
 
+  pinMode(ANALOG_PIN_1, INPUT);
+  pinMode(ANALOG_PIN_2, INPUT);
+
+  loadRefConfig();
+
   bool force = (digitalRead(SETUP_PIN) == LOW);
   bool haveConfig = loadConfig();
 
@@ -408,15 +527,16 @@ void setup() {
     Serial.print("Connected, IP: ");
     Serial.println(WiFi.localIP());
 
+    WiFi.setAutoReconnect(true);
+    checkInternet();
+
     // แสดง MAC Address ที่ถูกต้องหลังจากต่อ Wi-Fi สำเร็จแล้ว
     Serial.print("Wi-Fi MAC: ");
     Serial.println(WiFi.macAddress());
 
-    WiFi.setAutoReconnect(true);
-    checkInternet();
-
     server.on("/", HTTP_GET, handleRoot);
     server.on("/save", HTTP_POST, handleSave);
+    server.on("/save_ref", HTTP_POST, handleSaveRef);
     server.onNotFound(handleRoot);
     server.begin();
     Serial.printf("Web server running at http://%s\n", WiFi.localIP().toString().c_str());
@@ -431,4 +551,5 @@ void setup() {
 void loop() {
   server.handleClient();
   handleApiTasks();
+  handleAnalogTasks();
 }
